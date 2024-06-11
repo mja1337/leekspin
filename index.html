@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Leekspin Remake</title>
+    <style>
+        body {
+            background-color: #f0f8ff;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            font-family: Arial, sans-serif;
+        }
+        .container {
+            position: relative;
+            text-align: center;
+        }
+        .counter {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            background-color: rgba(0, 0, 0, 0.5);
+            color: #fff;
+            padding: 5px 10px;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <img src="https://upload.wikimedia.org/wikipedia/en/9/9d/Loituma.gif" alt="Leekspin" id="leekspin">
+        <div class="counter" id="counter">0 Spins</div>
+    </div>
+    <audio id="background-music" loop autoplay>
+        <source src="https://drive.google.com/uc?export=download&id=10pSmuhBi405qSn48rJ98uXbZA9euJNKS" type="audio/mpeg">
+        Your browser does not support the audio tag.
+    </audio>
+    <script>
+        const gif = document.getElementById('leekspin');
+        const counter = document.getElementById('counter');
+        const audio = document.getElementById('background-music');
+        let spinCount = 0;
+        let isPlaying = true;
+
+        // Initialize the spin counter and set an interval to update it
+        gif.addEventListener('load', () => {
+            const duration = 450; // Approximate duration of the GIF in milliseconds
+            setInterval(() => {
+                spinCount++;
+                counter.textContent = `${spinCount} Spins`;
+            }, duration);
+        });
+
+        // Toggle music play/pause on GIF click
+        gif.addEventListener('click', () => {
+            if (isPlaying) {
+                audio.pause();
+            } else {
+                audio.play();
+            }
+            isPlaying = !isPlaying;
+        });
+    </script>
+</body>
+</html>
