@@ -45,11 +45,11 @@
         let spinCount = 0;
         let isPlaying = true;
 
-        // Update the spin counter every 2.5 seconds
+        // Update the spin counter every 430 milliseconds
         setInterval(() => {
             spinCount++;
             counter.textContent = `${spinCount} Spins`;
-        }, 2500); // Approximate duration of the GIF in milliseconds
+        }, 430); // Approximate duration of the GIF in milliseconds
 
         // Toggle music play/pause on GIF click
         gif.addEventListener('click', () => {
