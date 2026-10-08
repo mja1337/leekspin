@@ -27,23 +27,32 @@
             padding: 5px 10px;
             border-radius: 5px;
         }
+        .hint {
+            position: absolute;
+            top: calc(100% + 14px);
+            left: 50%;
+            transform: translateX(-50%);
+            margin: 0;
+            color: #444;
+            font-size: 14px;
+            line-height: 1.2;
+            white-space: nowrap;
+            pointer-events: none;
+        }
+        .hint[hidden] {
+            display: none;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <img src="https://upload.wikimedia.org/wikipedia/en/9/9d/Loituma.gif" alt="Leekspin" id="leekspin">
+        <p id="play-hint" class="hint" hidden>tap to play</p>
         <div class="counter" id="counter">0 Spins</div>
     </div>
-    <audio id="background-music" loop autoplay>
-        <source src="https://github.com/mja1337/leekspin/raw/main/leekspin.mp3" type="audio/mpeg">
-        Your browser does not support the audio tag.
-    </audio>
     <script>
-        const gif = document.getElementById('leekspin');
         const counter = document.getElementById('counter');
-        const audio = document.getElementById('background-music');
         let spinCount = 0;
-        let isPlaying = true;
 
         // Update the spin counter every 430 milliseconds
         setInterval(() => {
@@ -51,29 +60,420 @@
             counter.textContent = `${spinCount} Spins`;
         }, 430); // Approximate duration of the GIF in milliseconds
 
-        // Toggle music play/pause on GIF click
-        gif.addEventListener('click', () => {
-            if (isPlaying) {
-                audio.pause();
-            } else {
-                audio.play();
-            }
-            isPlaying = !isPlaying;
-        });
+        // One song, one player.
+        // When AudioContext is allowed to run, the mp3 is decoded, the
+        // encoder's digital silence is trimmed, and a looping buffer plays
+        // with no gap. resume() is always handled.
+        // When the context stays suspended, HTMLMediaElement.play() is the
+        // fallback (Firefox will start a media element under an autoplay
+        // allowlist while still refusing Web Audio). That promise is handled:
+        // a rejection means the browser blocked autoplay, and the first
+        // pointer, touch, click, or key starts playback and then drops the
+        // listeners.
+        (function () {
+            const SRC = 'leekspin.mp3';
+            const SILENCE = 0.0005;
+            const GESTURES = ['pointerdown', 'keydown', 'touchstart', 'click'];
 
-        // Try to start the audio on page load
-        window.addEventListener('load', () => {
-            // Autoplay might be blocked, attempt to play
-            const playPromise = audio.play();
-            if (playPromise !== undefined) {
-                playPromise.then(() => {
-                    console.log('Audio started');
-                }).catch(error => {
-                    console.log('Autoplay was prevented:', error);
-                    // Handle autoplay block, e.g., show a play button
+            const root = document.documentElement;
+            const hint = document.getElementById('play-hint');
+
+            let ctx = null;
+            let buffer = null;
+            let bufferPromise = null;
+            let source = null;
+            let el = null;
+            let mode = '';
+            let gesturesBound = false;
+            let everPlayed = false;
+            let wantAudio = true;
+            let arming = false;
+            let pausing = false;
+            let resumeAttempt = 0;
+
+            root.dataset.audioState = 'loading';
+
+            function setState(state) {
+                if (root.dataset.audioState === state) return;
+                root.dataset.audioState = state;
+                root.dataset.audioStates = root.dataset.audioStates
+                    ? root.dataset.audioStates + ',' + state
+                    : state;
+            }
+
+            function showHint() {
+                if (mode === 'buffer' && ctx && ctx.state === 'running' && source) return;
+                if (mode === 'element' && el && !el.paused) return;
+                arming = false;
+                bindGestures();
+                hint.hidden = false;
+                root.dataset.hintShown = '1';
+                setState('blocked');
+            }
+
+            function hideHint() {
+                hint.hidden = true;
+            }
+
+            function markPlaying(nextMode) {
+                mode = nextMode;
+                root.dataset.audioMode = nextMode;
+                everPlayed = true;
+                arming = false;
+                hideHint();
+                unbindGestures();
+                setState('playing');
+            }
+
+            function context() {
+                if (ctx) return ctx;
+                const AC = window.AudioContext || window.webkitAudioContext;
+                if (!AC) return null;
+                try {
+                    ctx = new AC({ latencyHint: 'playback' });
+                } catch (e) {
+                    ctx = new AC();
+                }
+                ctx.addEventListener('statechange', onState);
+                return ctx;
+            }
+
+            function trimSilence(audioCtx, audioBuf) {
+                const channels = audioBuf.numberOfChannels;
+                const length = audioBuf.length;
+                if (length < 2) return audioBuf;
+                const data = [];
+                for (let c = 0; c < channels; c++) data.push(audioBuf.getChannelData(c));
+                const audible = (index) => {
+                    for (let c = 0; c < channels; c++) {
+                        const sample = data[c][index];
+                        if (sample > SILENCE || sample < -SILENCE) return true;
+                    }
+                    return false;
+                };
+                let start = 0;
+                let end = length - 1;
+                while (start < end && !audible(start)) start++;
+                while (end > start && !audible(end)) end--;
+                const outLen = end - start + 1;
+                if (outLen < 2 || outLen === length) return audioBuf;
+                const trimmed = audioCtx.createBuffer(channels, outLen, audioBuf.sampleRate);
+                const fade = Math.min(64, outLen >> 1);
+                for (let c = 0; c < channels; c++) {
+                    const dst = trimmed.getChannelData(c);
+                    dst.set(data[c].subarray(start, end + 1));
+                    for (let i = 0; i < fade; i++) {
+                        const gain = i / fade;
+                        dst[i] *= gain;
+                        dst[outLen - 1 - i] *= gain;
+                    }
+                }
+                return trimmed;
+            }
+
+            function loadBuffer() {
+                if (buffer) return Promise.resolve(buffer);
+                if (bufferPromise) return bufferPromise;
+                const audioCtx = context();
+                if (!audioCtx) return Promise.reject(new Error('no audio context'));
+                bufferPromise = fetch(SRC)
+                    .then((res) => {
+                        if (!res.ok) throw new Error('audio ' + res.status);
+                        return res.arrayBuffer();
+                    })
+                    .then((raw) => audioCtx.decodeAudioData(raw))
+                    .then((decoded) => {
+                        buffer = trimSilence(audioCtx, decoded);
+                        root.dataset.audioReady = '1';
+                        return buffer;
+                    })
+                    .catch((err) => {
+                        bufferPromise = null;
+                        throw err;
+                    });
+                return bufferPromise;
+            }
+
+            function ensureElement() {
+                if (el) return el;
+                el = document.createElement('audio');
+                el.id = 'music';
+                el.preload = 'auto';
+                el.loop = true;
+                el.playsInline = true;
+                el.setAttribute('playsinline', '');
+                el.src = SRC;
+                el.hidden = true;
+                document.body.appendChild(el);
+                el.addEventListener('pause', onElementPause);
+                el.addEventListener('ended', onElementEnded);
+                return el;
+            }
+
+            function pauseElement() {
+                if (!el) return;
+                pausing = true;
+                try { el.pause(); } catch (e) {}
+                pausing = false;
+            }
+
+            function onElementPause() {
+                if (pausing || mode !== 'element' || !wantAudio || !el) return;
+                if (document.visibilityState === 'hidden') return;
+                const pending = el.play();
+                if (pending && typeof pending.then === 'function') {
+                    pending.then(() => markPlaying('element'), () => showHint());
+                }
+            }
+
+            function onElementEnded() {
+                if (mode !== 'element' || !wantAudio || !el) return;
+                const pending = el.play();
+                if (pending && typeof pending.catch === 'function') {
+                    pending.catch(() => showHint());
+                }
+            }
+
+            function startSource() {
+                if (source || !buffer || !ctx || ctx.state !== 'running') return false;
+                const node = ctx.createBufferSource();
+                node.buffer = buffer;
+                node.loop = true;
+                node.connect(ctx.destination);
+                source = node;
+                try {
+                    node.start();
+                } catch (e) {
+                    source = null;
+                    try { node.disconnect(); } catch (e2) {}
+                    return false;
+                }
+                node.onended = () => {
+                    if (source !== node) return;
+                    source = null;
+                    if (!wantAudio || document.visibilityState === 'hidden') return;
+                    if (ctx && ctx.state === 'running') startSource();
+                    else showHint();
+                };
+                pauseElement();
+                markPlaying('buffer');
+                return true;
+            }
+
+            // Prefer the gapless buffer once the context is actually running.
+            // Otherwise leave the media element in charge.
+            function claimBuffer() {
+                if (!ctx || ctx.state !== 'running' || !buffer) return false;
+                pauseElement();
+                if (!source) startSource();
+                return !!(source && mode === 'buffer');
+            }
+
+            function playElement() {
+                const media = ensureElement();
+                let pending;
+                try {
+                    pending = media.play();
+                } catch (err) {
+                    return Promise.reject(err);
+                }
+                if (!pending || typeof pending.then !== 'function') {
+                    if (!media.paused) markPlaying('element');
+                    return Promise.resolve();
+                }
+                return pending.then(() => {
+                    if (mode === 'buffer') {
+                        pauseElement();
+                        return;
+                    }
+                    markPlaying('element');
+                }, (err) => {
+                    if (mode !== 'buffer' && !(ctx && ctx.state === 'running' && source)) showHint();
+                    return Promise.reject(err);
                 });
             }
-        });
+
+            function onState() {
+                if (!wantAudio || !ctx) return;
+                if (ctx.state === 'running') {
+                    if (buffer && !source && (mode === 'buffer' || everPlayed || mode === '')) {
+                        // Only steal an element that is already the chosen mode
+                        // once we know the context can run. Boot decides first.
+                        if (mode !== 'element') claimBuffer();
+                    }
+                    if (source && mode === 'buffer') {
+                        hideHint();
+                        unbindGestures();
+                        setState('playing');
+                    }
+                    return;
+                }
+                if (!everPlayed || mode !== 'buffer' || document.visibilityState === 'hidden') return;
+                const attempt = ++resumeAttempt;
+                const pending = ctx.resume();
+                Promise.resolve(pending).then(() => {
+                    if (attempt !== resumeAttempt) return;
+                    if (ctx.state === 'running' && buffer && !source) startSource();
+                    else if (!source) showHint();
+                }, () => {
+                    if (!source) showHint();
+                });
+            }
+
+            function onFirstGesture() {
+                if (arming) return;
+                if (mode === 'buffer' && source && ctx && ctx.state === 'running') {
+                    hideHint();
+                    unbindGestures();
+                    return;
+                }
+                if (mode === 'element' && el && !el.paused) {
+                    hideHint();
+                    unbindGestures();
+                    return;
+                }
+                // One tap fires pointerdown and click. Arm once.
+                arming = true;
+                unbindGestures();
+                const audioCtx = context();
+                let resumePending = Promise.resolve();
+                if (audioCtx) {
+                    try {
+                        resumePending = audioCtx.resume();
+                    } catch (e) {
+                        resumePending = Promise.reject(e);
+                    }
+                    if (resumePending && typeof resumePending.catch === 'function') resumePending.catch(() => {});
+                }
+                // play() has to be called in this turn. Firefox and iOS drop
+                // the gesture if it happens after an await.
+                const mediaPending = playElement();
+                if (mediaPending && typeof mediaPending.catch === 'function') mediaPending.catch(() => {});
+                const afterResume = () => {
+                    if (audioCtx && audioCtx.state === 'running') claimBuffer();
+                };
+                afterResume();
+                Promise.resolve(resumePending).then(afterResume, () => {});
+                loadBuffer().then(() => {
+                    if (audioCtx && audioCtx.state === 'running') claimBuffer();
+                }).catch(() => {});
+            }
+
+            function bindGestures() {
+                if (gesturesBound) return;
+                gesturesBound = true;
+                for (let i = 0; i < GESTURES.length; i++) {
+                    window.addEventListener(GESTURES[i], onFirstGesture, { capture: true, passive: true });
+                }
+            }
+
+            function unbindGestures() {
+                if (!gesturesBound) return;
+                gesturesBound = false;
+                for (let i = 0; i < GESTURES.length; i++) {
+                    window.removeEventListener(GESTURES[i], onFirstGesture, { capture: true });
+                }
+            }
+
+            document.addEventListener('visibilitychange', () => {
+                if (!wantAudio || document.visibilityState !== 'visible') return;
+                if (mode === 'element') {
+                    if (el && el.paused) {
+                        const pending = el.play();
+                        if (pending && typeof pending.then === 'function') {
+                            pending.then(() => markPlaying('element'), () => showHint());
+                        }
+                    }
+                    return;
+                }
+                if (!ctx || !everPlayed) return;
+                const pending = ctx.resume();
+                Promise.resolve(pending).then(() => {
+                    if (ctx.state === 'running') {
+                        if (buffer && !source) startSource();
+                        else if (source) {
+                            hideHint();
+                            setState('playing');
+                        }
+                    } else if (!source) showHint();
+                }, () => {
+                    if (!source) showHint();
+                });
+            });
+
+            window.addEventListener('pageshow', () => {
+                if (!wantAudio || !everPlayed) return;
+                if (mode === 'element' && el && el.paused) {
+                    const pending = el.play();
+                    if (pending && typeof pending.then === 'function') {
+                        pending.then(() => markPlaying('element'), () => showHint());
+                    }
+                    return;
+                }
+                if (!ctx) return;
+                const pending = ctx.resume();
+                Promise.resolve(pending).then(() => {
+                    if (ctx.state === 'running' && buffer && !source) startSource();
+                }, () => {});
+            });
+
+            window.addEventListener('online', () => {
+                if (!wantAudio || buffer) return;
+                loadBuffer().then(() => {
+                    if (ctx && ctx.state === 'running' && !source && mode !== 'element') startSource();
+                }).catch(() => {});
+            });
+
+            setInterval(() => {
+                if (!wantAudio || mode !== 'buffer' || document.visibilityState !== 'visible') return;
+                if (!ctx || ctx.state !== 'running' || !buffer || source) return;
+                startSource();
+            }, 1000);
+
+            function boot() {
+                const audioCtx = context();
+                const loading = audioCtx ? loadBuffer() : Promise.reject(new Error('no audio'));
+                loading.then(() => {
+                    if (audioCtx && audioCtx.state === 'running') claimBuffer();
+                }).catch(() => {
+                    if (!source && mode !== 'element') showHint();
+                });
+
+                if (audioCtx && audioCtx.state === 'running') return;
+
+                bindGestures();
+                if (audioCtx) {
+                    let pending;
+                    try { pending = audioCtx.resume(); } catch (e) { pending = Promise.reject(e); }
+                    if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+                    Promise.resolve(pending).then(() => {
+                        if (audioCtx.state === 'running') {
+                            loading.then(() => claimBuffer()).catch(() => {});
+                        }
+                    }, () => {});
+                }
+
+                // play() is the signal browsers actually reject when autoplay
+                // is blocked. Chrome leaves resume() pending instead.
+                const playPromise = playElement();
+                Promise.resolve(playPromise).then(() => {
+                    if (audioCtx && audioCtx.state === 'running') {
+                        loading.then(() => claimBuffer()).catch(() => {});
+                        return;
+                    }
+                    // Give a context that is about to run one beat to win,
+                    // so we don't settle on the element and the buffer both.
+                    setTimeout(() => {
+                        if (audioCtx && audioCtx.state === 'running' && buffer) claimBuffer();
+                        else if (el && !el.paused && mode !== 'buffer') markPlaying('element');
+                    }, 80);
+                }).catch(() => {
+                    if (!(audioCtx && audioCtx.state === 'running')) showHint();
+                });
+            }
+
+            boot();
+        })();
     </script>
 </body>
 </html>
